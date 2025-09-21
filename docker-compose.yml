@@ -1,0 +1,73 @@
+services:
+  datarack-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: datarack-news-app
+    ports:
+      - "7860:7860"
+    environment:
+      - SERP_API_KEY=${SERP_API_KEY}
+      - DATABASE_URL=${DATABASE_URL:-}
+    volumes:
+      # Mount .env file for environment variables
+      - ./.env:/app/.env:ro
+      # Optional: Mount for persistent data/logs
+      - ./data:/app/data
+    networks:
+      - datarack-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Optional PostgreSQL database service
+  postgres:
+    image: postgres:15-alpine
+    container_name: datarack-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-datarack}
+      POSTGRES_USER: ${POSTGRES_USER:-datarack_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - datarack-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-datarack_user} -d ${POSTGRES_DB:-datarack}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Optional Redis for caching (if needed later)
+  redis:
+    image: redis:7-alpine
+    container_name: datarack-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - datarack-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  datarack-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
