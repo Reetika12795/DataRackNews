@@ -1,0 +1,202 @@
+name: Deploy Staging Documentation
+
+on:
+  push:
+    branches: [ develop, feature/*, docs/* ]
+    paths: 
+      - 'docs/**'
+      - 'mkdocs.yml'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy to staging'
+        required: true
+        default: 'develop'
+
+permissions:
+  contents: read
+  pages: write
+
+jobs:
+  build-staging:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.branch || github.ref }}
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        pip install mkdocs-material mkdocs-mermaid2-plugin
+        pip install mkdocs-git-revision-date-localized-plugin
+    
+    - name: Add staging banner
+      run: |
+        # Add staging warning to index page
+        cat > /tmp/staging_banner.md << 'EOF'
+        !!! warning "🚧 Staging Documentation"
+            
+            **This is staging documentation** and may contain:
+            
+            - Incomplete or experimental features
+            - Work-in-progress content
+            - Unverified information
+            - Breaking changes
+            
+            **Production documentation**: [View stable version →](https://yourusername.github.io/DataRackNews/)
+            
+            **Branch**: `${{ github.ref_name }}`  
+            **Commit**: `${{ github.sha }}`  
+            **Built**: $(date -u)
+
+        ---
+
+        EOF
+        
+        # Prepend to index.md
+        cat /tmp/staging_banner.md docs/index.md > /tmp/new_index.md
+        mv /tmp/new_index.md docs/index.md
+    
+    - name: Update site configuration for staging
+      run: |
+        # Update mkdocs.yml for staging
+        sed -i 's/site_name: DataRackNews Documentation/site_name: DataRackNews Documentation (Staging)/' mkdocs.yml
+        sed -i 's/repo_name: Reetika12795\/DataRackNews/repo_name: Reetika12795\/DataRackNews (Staging)/' mkdocs.yml
+        
+        # Add staging theme customization
+        cat >> mkdocs.yml << 'EOF'
+
+        # Staging-specific configuration
+        extra:
+          version:
+            provider: mike
+            default: staging
+          staging: true
+
+        extra_css:
+          - assets/staging.css
+
+        EOF
+        
+        # Create staging CSS
+        mkdir -p docs/assets
+        cat > docs/assets/staging.css << 'EOF'
+        /* Staging-specific styles */
+        .md-header {
+          background: linear-gradient(45deg, #ff6b35, #f7931e) !important;
+        }
+
+        .md-header__title::after {
+          content: " (STAGING)";
+          font-size: 0.7em;
+          opacity: 0.8;
+          background: rgba(255,255,255,0.2);
+          padding: 2px 6px;
+          border-radius: 3px;
+          margin-left: 8px;
+        }
+
+        .md-tabs {
+          border-bottom: 2px solid #ff6b35;
+        }
+        EOF
+    
+    - name: Build staging documentation
+      run: |
+        echo "Building staging documentation from branch: ${{ github.ref_name }}"
+        mkdocs build --strict --verbose
+    
+    - name: Deploy to staging path
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./site
+        destination_dir: staging/${{ github.ref_name }}
+        keep_files: true
+        
+    - name: Create staging index
+      run: |
+        # Create an index of all staging deployments
+        cat > /tmp/staging_index.html << 'EOF'
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>DataRackNews - Staging Deployments</title>
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 40px; }
+                .header { background: linear-gradient(45deg, #ff6b35, #f7931e); color: white; padding: 20px; border-radius: 8px; }
+                .branch { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #ff6b35; }
+                .branch a { color: #0066cc; text-decoration: none; font-weight: bold; }
+                .branch a:hover { text-decoration: underline; }
+                .meta { color: #666; font-size: 0.9em; margin-top: 5px; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>DataRackNews - Staging Deployments</h1>
+                <p>Preview documentation for different branches and features</p>
+            </div>
+            
+            <div class="branch">
+                <a href="staging/${{ github.ref_name }}/">📝 ${{ github.ref_name }}</a>
+                <div class="meta">
+                    Latest deployment: $(date -u)<br>
+                    Commit: ${{ github.sha }}<br>
+                    Deployed from: ${{ github.ref }}
+                </div>
+            </div>
+            
+            <div class="branch">
+                <a href="../">🏠 Back to Production Documentation</a>
+                <div class="meta">Stable, production-ready documentation</div>
+            </div>
+            
+            <hr style="margin: 30px 0;">
+            <p style="color: #666; font-size: 0.9em;">
+                🚧 <strong>Staging Notice:</strong> These deployments are for testing and may contain incomplete features.
+            </p>
+        </body>
+        </html>
+        EOF
+        
+        mkdir -p staging_site
+        cp /tmp/staging_index.html staging_site/index.html
+        
+    - name: Deploy staging index
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./staging_site
+        destination_dir: staging
+        keep_files: true
+        
+    - name: Comment on PR (if applicable)
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const stagingUrl = `https://${context.repo.owner}.github.io/${context.repo.repo}/staging/${context.ref.replace('refs/heads/', '')}/`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `📚 **Staging Documentation Updated**
+            
+            Your documentation changes have been deployed to staging:
+            
+            🔗 **Preview URL**: ${stagingUrl}
+            
+            This staging deployment includes:
+            - All changes from this branch
+            - Staging banner and warnings
+            - Branch and commit information
+            
+            The staging site will be updated automatically with each push to this branch.`
+          });

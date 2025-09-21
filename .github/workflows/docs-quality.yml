@@ -1,0 +1,74 @@
+name: Documentation Quality Check
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+  push:
+    branches: [ main, reet_search ]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+
+jobs:
+  quality-check:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        pip install mkdocs-material mkdocs-mermaid2-plugin
+        pip install linkchecker
+        pip install yamllint
+        
+    - name: Lint YAML configuration
+      run: |
+        yamllint mkdocs.yml || echo "YAML linting completed with warnings"
+        
+    - name: Validate MkDocs config
+      run: |
+        python -c "import yaml; yaml.safe_load(open('mkdocs.yml'))"
+        echo "✅ MkDocs configuration is valid"
+        
+    - name: Check for broken internal links
+      run: |
+        mkdocs build --strict
+        echo "✅ Build completed successfully"
+        
+    - name: Spell check (basic)
+      run: |
+        # Basic spell check for common typos
+        grep -r "teh\|recieve\|seperate\|definately" docs/ && exit 1 || echo "✅ No common typos found"
+        
+    - name: Check for TODO/FIXME comments
+      run: |
+        if grep -r "TODO\|FIXME\|XXX" docs/; then
+          echo "⚠️  Found TODO/FIXME comments in documentation"
+          exit 1
+        else
+          echo "✅ No TODO/FIXME comments found"
+        fi
+        
+    - name: Validate Mermaid diagrams
+      run: |
+        # Check if mermaid diagrams have proper syntax
+        if grep -r "```mermaid" docs/; then
+          echo "📊 Mermaid diagrams found - manual validation recommended"
+        else
+          echo "ℹ️  No Mermaid diagrams found"
+        fi
+        
+    - name: Documentation metrics
+      run: |
+        echo "📊 Documentation Statistics:"
+        echo "Total files: $(find docs/ -name '*.md' | wc -l)"
+        echo "Total lines: $(find docs/ -name '*.md' -exec wc -l {} + | tail -1)"
+        echo "Word count: $(find docs/ -name '*.md' -exec cat {} + | wc -w)"

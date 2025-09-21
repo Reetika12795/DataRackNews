@@ -1,0 +1,136 @@
+name: Deploy MkDocs to GitHub Pages
+
+on:
+  push:
+    branches: [ main, reet_search ]
+    paths: 
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: Cache MkDocs dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-mkdocs-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-mkdocs-
+    
+    - name: Install MkDocs and dependencies
+      run: |
+        pip install --upgrade pip
+        pip install mkdocs-material>=9.4.0
+        pip install mkdocs-mermaid2-plugin>=1.1.0
+        pip install mkdocs-git-revision-date-localized-plugin>=1.2.0
+        pip install mkdocs-minify-plugin>=0.7.0
+        pip install mkdocs-redirects>=1.2.0
+        pip install pillow>=10.0.0
+        pip install cairosvg>=2.7.0
+    
+    - name: Validate MkDocs configuration
+      run: |
+        mkdocs --version
+        python -c "import yaml; yaml.safe_load(open('mkdocs.yml'))"
+        echo "✅ MkDocs configuration is valid"
+    
+    - name: Build documentation
+      run: |
+        echo "Building DataRackNews documentation..."
+        mkdocs build --strict --verbose
+        echo "✅ Documentation built successfully"
+    
+    - name: Verify build output
+      run: |
+        ls -la site/
+        echo "✅ Build verification complete"
+        
+        # Check for critical files
+        if [ ! -f "site/index.html" ]; then
+          echo "❌ Error: index.html not found"
+          exit 1
+        fi
+        
+        # Check for assets
+        if [ ! -d "site/assets" ]; then
+          echo "⚠️  Warning: assets directory not found"
+        fi
+        
+        echo "📊 Site size: $(du -sh site/)"
+    
+    - name: Setup Pages
+      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/reet_search'
+      uses: actions/configure-pages@v3
+    
+    - name: Upload artifact
+      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/reet_search'
+      uses: actions/upload-pages-artifact@v2
+      with:
+        path: ./site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/reet_search'
+    steps:
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v2
+      
+    - name: Post-deployment verification
+      run: |
+        echo "🚀 Documentation deployed successfully!"
+        echo "📖 Documentation URL: ${{ steps.deployment.outputs.page_url }}"
+        echo "🔗 Visit your documentation at the URL above"
+        
+        # Test the deployed site
+        sleep 10
+        curl -I "${{ steps.deployment.outputs.page_url }}" || echo "⚠️  Site may take a few minutes to be available"
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [build, deploy]
+    if: always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/reet_search')
+    steps:
+    - name: Deployment Status
+      run: |
+        if [ "${{ needs.deploy.result }}" == "success" ]; then
+          echo "✅ Documentation deployment successful!"
+          echo "📚 Your DataRackNews documentation is now live"
+        else
+          echo "❌ Documentation deployment failed"
+          echo "🔍 Check the logs above for details"
+          exit 1
+        fi
