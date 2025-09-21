@@ -468,5 +468,5 @@ docker compose up -d
 
 ---
 
-**Made with ❤️ for the data center community**
+**Made with ❤️ for the AI tinkerer hackathon team **
 
