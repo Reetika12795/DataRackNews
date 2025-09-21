@@ -160,15 +160,16 @@ class EnergyAnalyzer:
         """Get carbon intensity data using SerpAPI AI Mode"""
         return self.search_carbon_intensity_ai(country_code.upper())
 
-    def search_electricity_price_ai(self, country: str) -> Optional[Dict]:
-        """Use SerpAPI Google AI Mode to find current electricity price for data centers in EUR/MWh.
-        Accepts country code (e.g., 'DE') or country name (e.g., 'Germany')."""
+    def search_electricity_price_ai(self, country: str, year: Optional[int] = 2025) -> Optional[Dict]:
+        """Use SerpAPI Google AI Mode to find industrial electricity price in EUR/MWh for a target year.
+        Accepts country code (e.g., 'DE') or country name (e.g., 'Germany'). Default year is 2025."""
         if not self.serpapi_key:
             print("Warning: No SerpAPI key provided. Cannot fetch electricity price.")
             return None
+        year_str = str(year) if year else "2025"
         query = (
-            f"What is the current average industrial electricity price in {country} in EUR/MWh? "
-            f"If price is given in €/kWh or c/kWh, provide it too. Prefer 2024-2025 data."
+            f"What is the average industrial electricity price in {country} in EUR/MWh for {year_str}? "
+            f"If price is given in €/kWh or c/kWh, provide it too. Prefer official 2025 sources."
         )
         params = {
             "engine": "google",
@@ -186,7 +187,7 @@ class EnergyAnalyzer:
             data = response.json()
             price_data = self._extract_price_from_ai(data, country)
             if not price_data:
-                price_data = self._extract_price_from_results(data, country)
+                price_data = self._extract_price_from_results(data, country, prefer_year=year)
             if price_data:
                 price_data["source"] = "SerpAPI Google AI Mode"
                 price_data["search_method"] = "ai"
@@ -209,23 +210,44 @@ class EnergyAnalyzer:
             return self._parse_price_from_text(text, country)
         return None
 
-    def _extract_price_from_results(self, data: Dict, country: str) -> Optional[Dict]:
+    def _extract_price_from_results(self, data: Dict, country: str, prefer_year: Optional[int] = None) -> Optional[Dict]:
         organic_results = data.get("organic_results", [])
-        for result in organic_results[:5]:
+        # Prefer results that mention the target year in title/snippet
+        preferred: List[Dict] = []
+        others: List[Dict] = []
+        year_token = str(prefer_year) if prefer_year else None
+        for result in organic_results[:10]:
             title = result.get("title", "")
             snippet = result.get("snippet", "")
             text = f"{title} {snippet}"
-            price_data = self._parse_price_from_text(text, country)
-            if price_data:
-                price_data["result_title"] = title
-                price_data["result_url"] = result.get("link", "")
-                return price_data
+            if year_token and year_token in text:
+                preferred.append(result)
+            else:
+                others.append(result)
+        for bucket in (preferred, others):
+            for result in bucket:
+                title = result.get("title", "")
+                snippet = result.get("snippet", "")
+                text = f"{title} {snippet}"
+                price_data = self._parse_price_from_text(text, country)
+                if price_data:
+                    price_data["result_title"] = title
+                    price_data["result_url"] = result.get("link", "")
+                    return price_data
         return None
 
     def _parse_price_from_text(self, text: str, country: str) -> Optional[Dict]:
         """Parse electricity price and normalize to EUR/MWh.
         Supports patterns: EUR/MWh, €/MWh, €/kWh, c/kWh."""
         try:
+            # Try to detect an explicit year present in the snippet
+            detected_year = None
+            ym = re.search(r"(20\d{2})", text)
+            if ym:
+                try:
+                    detected_year = int(ym.group(1))
+                except Exception:
+                    detected_year = None
             # EUR/MWh or €/MWh
             m = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:EUR|€)\s*/\s*MWh", text, re.IGNORECASE)
             if m:
@@ -236,6 +258,7 @@ class EnergyAnalyzer:
                     "unit_detected": "EUR/MWh",
                     "extracted_text": text[:200] + ("..." if len(text) > 200 else ""),
                     "datetime": datetime.now(timezone.utc).isoformat(),
+                    "detected_year": detected_year,
                 }
             # EUR/kWh or €/kWh
             m = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:EUR|€)\s*/\s*kWh", text, re.IGNORECASE)
@@ -248,6 +271,7 @@ class EnergyAnalyzer:
                     "unit_detected": "EUR/kWh",
                     "extracted_text": text[:200] + ("..." if len(text) > 200 else ""),
                     "datetime": datetime.now(timezone.utc).isoformat(),
+                    "detected_year": detected_year,
                 }
             # c/kWh (cents per kWh)
             m = re.search(r"(\d+(?:[\.,]\d+)?)\s*c\s*/\s*kWh", text, re.IGNORECASE)
@@ -260,14 +284,15 @@ class EnergyAnalyzer:
                     "unit_detected": "c/kWh",
                     "extracted_text": text[:200] + ("..." if len(text) > 200 else ""),
                     "datetime": datetime.now(timezone.utc).isoformat(),
+                    "detected_year": detected_year,
                 }
         except Exception:
             pass
         return None
 
-    def get_electricity_price(self, country: str) -> Optional[Dict]:
-        """Convenience wrapper to fetch electricity price (EUR/MWh)."""
-        return self.search_electricity_price_ai(country)
+    def get_electricity_price(self, country: str, year: Optional[int] = 2025) -> Optional[Dict]:
+        """Convenience wrapper to fetch electricity price (EUR/MWh) for a target year (default 2025)."""
+        return self.search_electricity_price_ai(country, year)
     
     def calculate_location_emissions(self, capacity_mw: float, country_code: str) -> Optional[Dict]:
         """
@@ -431,6 +456,63 @@ class EnergyAnalyzer:
             "uptime_percent": uptime_percent,
             "recorded_at": timestamp,
         }
+
+    def metrics_from_data_center_record(
+        self,
+        data_center_record: Dict,
+        country_code: Optional[str] = None,
+        temperature_celsius: Optional[float] = None,
+        uptime_percent: Optional[float] = None,
+        recorded_at: Optional[str] = None,
+        auto_price: bool = True,
+    ) -> Dict:
+        """
+        Produce a `metrics` table record from a `data_centers`-shaped record.
+        Expects keys: id, power_capacity_mw, country (or provide country_code explicitly).
+        - Computes energy and emissions using calculate_location_emissions()
+        - Uses export_metrics_record() to emit schema-compliant dict
+        """
+        if not data_center_record or "id" not in data_center_record:
+            return {"error": "data_center_record missing id"}
+
+        capacity_mw = data_center_record.get("power_capacity_mw")
+        if not isinstance(capacity_mw, (int, float)):
+            try:
+                capacity_mw = float(capacity_mw) if capacity_mw is not None else None
+            except Exception:
+                capacity_mw = None
+
+        if not capacity_mw or capacity_mw <= 0:
+            return {"error": "Invalid or missing power_capacity_mw"}
+
+        zone = (country_code or data_center_record.get("country") or "").strip()
+        if not zone:
+            return {"error": "Missing country_code/country for carbon intensity lookup"}
+
+        # Build a minimal data_center input shape for calculate_energy_metrics()
+        dc_input = {
+            "title": data_center_record.get("name"),
+            "operator": data_center_record.get("operator"),
+            "location": {
+                "city": data_center_record.get("city"),
+                "country": data_center_record.get("country"),
+            },
+            "estimated_capacity": f"{capacity_mw}MW",
+        }
+
+        energy_metrics = self.calculate_energy_metrics(dc_input, zone)
+        if "error" in energy_metrics:
+            return {"error": energy_metrics.get("error", "Failed energy metrics calc")}
+
+        return self.export_metrics_record(
+            energy_metrics=energy_metrics,
+            data_center_id=data_center_record["id"],
+            price_eur_per_mwh=None,
+            temperature_celsius=temperature_celsius,
+            uptime_percent=uptime_percent,
+            recorded_at=recorded_at,
+            auto_price=auto_price,
+        )
 
     def export_records_to_file(self, records: list, out_path: str) -> bool:
         """Write a list of metrics records to a JSON file."""

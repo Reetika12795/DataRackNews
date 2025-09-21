@@ -7,6 +7,9 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+import uuid
+from datetime import datetime, timezone
+import os
 
 
 OPERATOR = "DataCenters.com"
@@ -76,6 +79,50 @@ def search_locations(country: str, city: Optional[str] = None) -> List[str]:
         return []
 
 
+def _infer_operator_from_title(title: str) -> Optional[str]:
+    if not title:
+        return None
+    # Many pages use pattern: "Equinix: PA10 Paris IBX Data Center"
+    if ":" in title:
+        left = title.split(":", 1)[0].strip()
+        # Avoid generic site label
+        if left.lower() != OPERATOR.lower():
+            return left
+    return None
+
+
+def _infer_operator_from_url(url: str) -> Optional[str]:
+    try:
+        path = urlparse(url).path.strip("/")
+        first_seg = (path.split("/", 1)[0] or "").lower()
+        # Direct mappings for common vendors
+        mappings = {
+            "equinix": "Equinix",
+            "digital-realty": "Digital Realty",
+            "telehouse": "Telehouse",
+            "global-switch": "Global Switch",
+            "oracle": "Oracle",
+            "ibm-cloud": "IBM Cloud",
+            "microsoft-azure": "Microsoft Azure",
+            "ntt": "NTT",
+            "ntt-docomo": "NTT DOCOMO",
+            "atlasedge": "AtlasEdge Data Centers",
+            "exa-infrastructure": "EXA Infrastructure",
+            "opcore": "Opcore",
+        }
+        # Exact first segment match
+        if first_seg in mappings:
+            return mappings[first_seg]
+        # Keyword-based fallback on entire slug
+        slug = first_seg
+        for key, name in mappings.items():
+            if key in slug:
+                return name
+    except Exception:
+        pass
+    return None
+
+
 def parse_facility_details(html: str, url: str) -> Optional[Dict]:
     """
     Parse individual facility page to extract location, space, and power information.
@@ -87,13 +134,21 @@ def parse_facility_details(html: str, url: str) -> Optional[Dict]:
         title_element = soup.find("h1") or soup.find("title")
         title = title_element.get_text(strip=True) if title_element else "Unknown Facility"
         
-        # Extract operator information from div with class 'text-xs text-gray-500'
-        operator = OPERATOR  # Default fallback
-        operator_element = soup.find("div", class_="text-xs text-gray-500")
-        if operator_element:
-            operator_text = operator_element.get_text(strip=True)
-            if operator_text:
-                operator = operator_text
+        # Infer operator using multiple signals: Title prefix, URL slug, then fallback label
+        operator = (
+            _infer_operator_from_title(title)
+            or _infer_operator_from_url(url)
+            or None
+        )
+        if not operator:
+            operator_element = soup.find("div", class_="text-xs text-gray-500")
+            if operator_element:
+                operator_text = operator_element.get_text(strip=True)
+                # Use only if it's not the site label
+                if operator_text and operator_text.lower() != OPERATOR.lower():
+                    operator = operator_text
+        # Final fallback
+        operator = operator or OPERATOR
         
         # Extract location information
         location_info = {}
@@ -222,22 +277,241 @@ def scrape_facilities(country: str, city: Optional[str] = None) -> List[Dict]:
     return facilities
 
 
+# =============================
+# Normalization for PostgreSQL
+# =============================
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def normalize_facility_to_data_center(facility: Dict) -> Dict:
+    """
+    Convert a facility dict from parse_facility_details() into a data_centers record shape.
+    Fields mapped:
+      - id (uuid)
+      - name (title)
+      - city, country (best-effort from location)
+      - latitude, longitude (None - not available on this site)
+      - power_capacity_mw (from specifications.power_mw)
+      - server_count (None) — unknown
+      - tier_level (None) — unknown
+      - operator (operator)
+      - status ("active")
+      - created_at, updated_at (UTC timestamps)
+    """
+    loc = facility.get("location", {}) or {}
+    specs = facility.get("specifications", {}) or {}
+
+    # Parse numeric power if possible
+    power_val = None
+    try:
+        if specs.get("power_mw") is not None:
+            power_val = float(str(specs.get("power_mw")).strip())
+    except Exception:
+        power_val = None
+
+    record = {
+        "id": str(uuid.uuid4()),
+        "name": facility.get("title") or "Unknown Facility",
+        "city": (loc.get("city") or "") or None,
+        "country": (loc.get("country") or "") or None,
+        "latitude": None,
+        "longitude": None,
+        "power_capacity_mw": power_val,
+        "server_count": None,
+        "tier_level": None,
+        "operator": facility.get("operator") or OPERATOR,
+        "status": "active",
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+    }
+    return record
+
+def build_search_cache_record(data_center_record: Dict, latest_cost_eur: Optional[float] = None) -> Dict:
+    """
+    Build a search_cache record using a data_centers record.
+    - Tags include operator, country, city, status.
+    - latest_power_mw mirrors data_center.power_capacity_mw.
+    """
+    name = data_center_record.get("name") or ""
+    operator = data_center_record.get("operator") or ""
+    country = data_center_record.get("country") or ""
+    city = data_center_record.get("city") or ""
+    status = data_center_record.get("status") or ""
+
+    tags = [t for t in [operator, country, city, status] if t]
+    search_text = " ".join([s for s in [name, operator, city, country] if s])
+
+    rec = {
+        "id": str(uuid.uuid4()),
+        "data_center_id": data_center_record["id"],
+        "search_text": search_text,
+        "tags": tags,
+        "latest_cost_eur": latest_cost_eur,
+        "latest_power_mw": data_center_record.get("power_capacity_mw"),
+        "updated_at": _now_iso(),
+    }
+    return rec
+
+def _compose_address(loc: Dict) -> Optional[str]:
+    if not isinstance(loc, dict):
+        return None
+    parts = []
+    for key in ("address", "city", "country"):
+        val = (loc.get(key) or "").strip()
+        if val:
+            parts.append(val)
+    return ", ".join(parts) if parts else None
+
+
+def geocode_address(query: str, email: Optional[str] = None, timeout: int = 15) -> Optional[Dict]:
+    """
+    Use OpenStreetMap Nominatim to geocode an address string. Returns {lat, lon} or None.
+    Respect usage policy: include a descriptive User-Agent and contact email if provided.
+    """
+    try:
+        params = {
+            "q": query,
+            "format": "json",
+            "limit": 1,
+            "addressdetails": 0,
+        }
+        ua = f"DataRackNews/1.0 (+https://example.com)"
+        if email:
+            ua = f"DataRackNews/1.0 ({email})"
+        headers = {"User-Agent": ua}
+        resp = requests.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            item = data[0]
+            lat = float(item.get("lat")) if item.get("lat") else None
+            lon = float(item.get("lon")) if item.get("lon") else None
+            if lat is not None and lon is not None:
+                return {"lat": lat, "lon": lon}
+    except Exception as e:
+        print(f"[geocode] Failed for '{query}': {e}")
+    return None
+
+
+def geocode_address_serpapi(query: str, api_key: Optional[str], timeout: int = 15) -> Optional[Dict]:
+    """
+    Use SerpAPI Google Maps to geocode an address string. Returns {lat, lon} or None.
+    Requires a valid SerpAPI API key.
+    """
+    if not api_key:
+        return None
+    try:
+        params = {
+            "engine": "google_maps",
+            "q": query,
+            "api_key": api_key,
+            "type": "search",
+            "hl": "en",
+        }
+        resp = requests.get("https://serpapi.com/search", params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        # Try place_results (newer API shape)
+        place_results = data.get("place_results")
+        if isinstance(place_results, dict):
+            gps = place_results.get("gps_coordinates") or {}
+            lat = gps.get("latitude")
+            lon = gps.get("longitude")
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                return {"lat": float(lat), "lon": float(lon)}
+        # Fallback to local_results list
+        local_results = data.get("local_results") or data.get("local_results_more_results")
+        if isinstance(local_results, list) and local_results:
+            first = local_results[0]
+            gps = first.get("gps_coordinates") or {}
+            lat = gps.get("latitude")
+            lon = gps.get("longitude")
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                return {"lat": float(lat), "lon": float(lon)}
+    except Exception as e:
+        print(f"[geocode-serpapi] Failed for '{query}': {e}")
+    return None
+
+
+def facilities_to_db_payload(
+    facilities: List[Dict],
+    geocode: bool = False,
+    email: Optional[str] = None,
+    geocode_delay_s: float = 1.0,
+    geocode_provider: str = "nominatim",
+    serpapi_token: Optional[str] = None,
+) -> Dict[str, List[Dict]]:
+    """
+    Convert a list of scraped facilities into DB-ready payloads.
+    Returns a dict with keys: data_centers, search_cache.
+    """
+    data_centers: List[Dict] = []
+    search_cache: List[Dict] = []
+
+    for fac in facilities:
+        dc = normalize_facility_to_data_center(fac)
+        # Optional geocoding if latitude/longitude are missing but we have an address
+        if geocode and (dc.get("latitude") is None or dc.get("longitude") is None):
+            full_addr = _compose_address(fac.get("location", {}) or {})
+            if full_addr:
+                geo = None
+                if geocode_provider == "serpapi":
+                    # Resolve token from env if not provided
+                    token = serpapi_token or os.getenv("SERPAPI_TOKEN")
+                    geo = geocode_address_serpapi(full_addr, token)
+                else:
+                    geo = geocode_address(full_addr, email=email)
+                if geo:
+                    dc["latitude"] = geo["lat"]
+                    dc["longitude"] = geo["lon"]
+                # Respectful rate limiting
+                time.sleep(geocode_delay_s)
+        sc = build_search_cache_record(dc)
+        data_centers.append(dc)
+        search_cache.append(sc)
+
+    return {
+        "data_centers": data_centers,
+        "search_cache": search_cache,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Scrape data center facilities from datacenters.com")
     parser.add_argument("--country", required=True, help="Country to search (e.g., 'france', 'spain')")
     parser.add_argument("--city", help="Optional city filter (e.g., 'paris', 'barcelona')")
     parser.add_argument("--output", help="Output JSON file path")
+    parser.add_argument("--db-ready", action="store_true", help="Output PostgreSQL-ready payload (data_centers + search_cache)")
+    parser.add_argument("--geocode", action="store_true", help="If set with --db-ready, geocode addresses to fill latitude/longitude")
+    parser.add_argument("--email", help="Contact email for geocoding User-Agent (recommended for Nominatim)")
+    parser.add_argument("--geocode-provider", choices=["nominatim", "serpapi"], default="nominatim", help="Geocoder to use for lat/lon")
+    parser.add_argument("--serpapi-token", help="SerpAPI token for google maps geocoding (falls back to env SERPAPI_TOKEN)")
     
     args = parser.parse_args()
     
     facilities = scrape_facilities(args.country, args.city)
     
     if args.output:
+        payload = facilities_to_db_payload(
+            facilities,
+            geocode=args.geocode,
+            email=args.email,
+            geocode_provider=args.geocode_provider,
+            serpapi_token=args.serpapi_token,
+        ) if args.db_ready else facilities
         with open(args.output, 'w', encoding='utf-8') as f:
-            json.dump(facilities, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"Results saved to {args.output}")
     else:
-        print(json.dumps(facilities, ensure_ascii=False, indent=2))
+        payload = facilities_to_db_payload(
+            facilities,
+            geocode=args.geocode,
+            email=args.email,
+            geocode_provider=args.geocode_provider,
+            serpapi_token=args.serpapi_token,
+        ) if args.db_ready else facilities
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

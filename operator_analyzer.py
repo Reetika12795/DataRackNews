@@ -2,8 +2,9 @@ from typing import Dict, List, Optional, Tuple
 import requests
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
+import uuid
 
 @dataclass
 class FinancialMetrics:
@@ -387,7 +388,7 @@ class NewsAnalyzer:
     def __init__(self, serpapi_key: str = None):
         self.serpapi_key = serpapi_key
         self.serpapi_base = "https://serpapi.com/search"
-        
+    
     def search_news(self, query: str, days_back: int = 30) -> Optional[List[Dict]]:
         """Search for news using SerpAPI Google News"""
         
@@ -454,6 +455,88 @@ class NewsAnalyzer:
                 continue
         
         return news_items
+
+    # ------------------------------
+    # DB helpers for articles table
+    # ------------------------------
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _parse_published_at(date_str: str) -> Optional[str]:
+        """
+        Best-effort parse of SerpAPI news date field. It can be relative (e.g., '3 days ago')
+        or absolute. For relative, map to current time minus the delta.
+        """
+        if not date_str:
+            return None
+        ds = date_str.strip().lower()
+        # Relative patterns
+        m = re.match(r"(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago", ds)
+        if m:
+            qty = int(m.group(1))
+            unit = m.group(2)
+            delta = None
+            if unit == "minute":
+                delta = timedelta(minutes=qty)
+            elif unit == "hour":
+                delta = timedelta(hours=qty)
+            elif unit == "day":
+                delta = timedelta(days=qty)
+            elif unit == "week":
+                delta = timedelta(weeks=qty)
+            elif unit == "month":
+                delta = timedelta(days=30 * qty)
+            elif unit == "year":
+                delta = timedelta(days=365 * qty)
+            if delta:
+                return (datetime.now(timezone.utc) - delta).isoformat()
+        # Try absolute formats common in feeds
+        for fmt in ("%b %d, %Y", "%Y-%m-%d", "%d %b %Y"):
+            try:
+                return datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc).isoformat()
+            except Exception:
+                continue
+        return None
+
+    def news_to_articles_records(
+        self,
+        data_center_id: str,
+        news_items: List[NewsItem],
+        article_type: str = "news",
+        published: bool = True,
+    ) -> List[Dict]:
+        """
+        Convert a list of NewsItem into `articles` records linked to a data center.
+        Fields mapped:
+          - id (uuid)
+          - data_center_id
+          - title (news title)
+          - content (empty; optional long-form not available)
+          - summary (news snippet)
+          - type (default 'news')
+          - published (default True)
+          - published_at (parsed from news date when possible)
+          - created_at (now)
+        """
+        records: List[Dict] = []
+        for item in news_items:
+            published_at = self._parse_published_at(item.date) or self._now_iso()
+            rec = {
+                "id": str(uuid.uuid4()),
+                "data_center_id": str(data_center_id),
+                "title": item.title,
+                # Store the article URL in content field due to schema constraints
+                "content": item.url or None,
+                "summary": item.snippet,
+                "type": article_type,
+                "published": published,
+                "published_at": published_at,
+                "created_at": self._now_iso(),
+            }
+            records.append(rec)
+        return records
 
 class OperatorAnalyzer:
     """Comprehensive analysis of data center operators combining financial and news data"""
