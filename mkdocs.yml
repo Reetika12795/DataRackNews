@@ -46,7 +46,7 @@ theme:
 # Plugins
 plugins:
   - search
-  # - mermaid2  # Temporarily disabled due to compatibility issue
+  - mermaid2
   - git-revision-date-localized:
       type: date
 
@@ -54,7 +54,11 @@ plugins:
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.highlight:
