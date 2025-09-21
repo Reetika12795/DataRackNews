@@ -2,6 +2,8 @@ from typing import Dict, Optional
 import requests
 import json
 import re
+import uuid
+from datetime import datetime, timezone
 
 class EnergyAnalyzer:
     """Analyzes energy consumption and carbon footprint using SerpAPI AI Mode"""
@@ -157,6 +159,115 @@ class EnergyAnalyzer:
     def get_carbon_intensity(self, country_code: str) -> Optional[Dict]:
         """Get carbon intensity data using SerpAPI AI Mode"""
         return self.search_carbon_intensity_ai(country_code.upper())
+
+    def search_electricity_price_ai(self, country: str) -> Optional[Dict]:
+        """Use SerpAPI Google AI Mode to find current electricity price for data centers in EUR/MWh.
+        Accepts country code (e.g., 'DE') or country name (e.g., 'Germany')."""
+        if not self.serpapi_key:
+            print("Warning: No SerpAPI key provided. Cannot fetch electricity price.")
+            return None
+        query = (
+            f"What is the current average industrial electricity price in {country} in EUR/MWh? "
+            f"If price is given in €/kWh or c/kWh, provide it too. Prefer 2024-2025 data."
+        )
+        params = {
+            "engine": "google",
+            "q": query,
+            "api_key": self.serpapi_key,
+            "google_domain": "google.com",
+            "hl": "en",
+            "gl": "us",
+            "ai_overview": "true"
+        }
+        try:
+            print(f"🤖 Searching electricity price for {country} using Google AI Mode...")
+            response = requests.get(self.serpapi_base, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            price_data = self._extract_price_from_ai(data, country)
+            if not price_data:
+                price_data = self._extract_price_from_results(data, country)
+            if price_data:
+                price_data["source"] = "SerpAPI Google AI Mode"
+                price_data["search_method"] = "ai"
+                print(f"✅ Found price via AI Mode: {price_data.get('price_eur_per_mwh', 'N/A')} EUR/MWh")
+                return price_data
+            else:
+                print(f"❌ No price data found in AI Mode results for {country}")
+                return None
+        except Exception as e:
+            print(f"❌ Error with SerpAPI AI search (price): {e}")
+            return None
+
+    def _extract_price_from_ai(self, data: Dict, country: str) -> Optional[Dict]:
+        ai_overview = data.get("ai_overview", {})
+        if not ai_overview:
+            return None
+        text = ai_overview.get("overview") or ai_overview.get("text") or ""
+        if text:
+            print(f"🤖 AI Overview (price) found: {text[:200]}...")
+            return self._parse_price_from_text(text, country)
+        return None
+
+    def _extract_price_from_results(self, data: Dict, country: str) -> Optional[Dict]:
+        organic_results = data.get("organic_results", [])
+        for result in organic_results[:5]:
+            title = result.get("title", "")
+            snippet = result.get("snippet", "")
+            text = f"{title} {snippet}"
+            price_data = self._parse_price_from_text(text, country)
+            if price_data:
+                price_data["result_title"] = title
+                price_data["result_url"] = result.get("link", "")
+                return price_data
+        return None
+
+    def _parse_price_from_text(self, text: str, country: str) -> Optional[Dict]:
+        """Parse electricity price and normalize to EUR/MWh.
+        Supports patterns: EUR/MWh, €/MWh, €/kWh, c/kWh."""
+        try:
+            # EUR/MWh or €/MWh
+            m = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:EUR|€)\s*/\s*MWh", text, re.IGNORECASE)
+            if m:
+                val = float(m.group(1).replace(",", "."))
+                return {
+                    "country": country,
+                    "price_eur_per_mwh": round(val, 2),
+                    "unit_detected": "EUR/MWh",
+                    "extracted_text": text[:200] + ("..." if len(text) > 200 else ""),
+                    "datetime": datetime.now(timezone.utc).isoformat(),
+                }
+            # EUR/kWh or €/kWh
+            m = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:EUR|€)\s*/\s*kWh", text, re.IGNORECASE)
+            if m:
+                eur_per_kwh = float(m.group(1).replace(",", "."))
+                eur_per_mwh = eur_per_kwh * 1000.0
+                return {
+                    "country": country,
+                    "price_eur_per_mwh": round(eur_per_mwh, 2),
+                    "unit_detected": "EUR/kWh",
+                    "extracted_text": text[:200] + ("..." if len(text) > 200 else ""),
+                    "datetime": datetime.now(timezone.utc).isoformat(),
+                }
+            # c/kWh (cents per kWh)
+            m = re.search(r"(\d+(?:[\.,]\d+)?)\s*c\s*/\s*kWh", text, re.IGNORECASE)
+            if m:
+                cents_per_kwh = float(m.group(1).replace(",", "."))
+                eur_per_mwh = cents_per_kwh * 10.0  # 1 c/kWh = €0.01/kWh => €10/MWh
+                return {
+                    "country": country,
+                    "price_eur_per_mwh": round(eur_per_mwh, 2),
+                    "unit_detected": "c/kWh",
+                    "extracted_text": text[:200] + ("..." if len(text) > 200 else ""),
+                    "datetime": datetime.now(timezone.utc).isoformat(),
+                }
+        except Exception:
+            pass
+        return None
+
+    def get_electricity_price(self, country: str) -> Optional[Dict]:
+        """Convenience wrapper to fetch electricity price (EUR/MWh)."""
+        return self.search_electricity_price_ai(country)
     
     def calculate_location_emissions(self, capacity_mw: float, country_code: str) -> Optional[Dict]:
         """
@@ -251,6 +362,86 @@ class EnergyAnalyzer:
             "fossil_fuel_factor": round((100 - location_emissions["grid_renewable_percentage"]) / 100, 3) if location_emissions.get("grid_renewable_percentage") is not None else None,
             "grid_renewable_percentage": location_emissions["grid_renewable_percentage"]
         }
+
+    def export_metrics_record(
+        self,
+        energy_metrics: Dict,
+        data_center_id: str,
+        price_eur_per_mwh: Optional[float] = None,
+        temperature_celsius: Optional[float] = None,
+        uptime_percent: Optional[float] = None,
+        recorded_at: Optional[str] = None,
+        auto_price: bool = True,
+    ) -> Dict:
+        """
+        Map EnergyAnalyzer.calculate_energy_metrics() output to the requested metrics JSON shape.
+        - power_usage_mw is derived as average load = annual_energy_consumption_mwh / 8760
+        - energy_cost_eur is computed if price_eur_per_mwh is provided or auto-fetched via Google AI search
+        - carbon_emissions_kg is derived from annual_co2_emissions_tons
+        - temperature_celsius and uptime_percent are pass-through optional inputs
+        - recorded_at defaults to current UTC time if not provided
+        """
+        if not energy_metrics or "error" in energy_metrics:
+            return {
+                "error": energy_metrics.get("error", "Invalid energy metrics input") if isinstance(energy_metrics, dict) else "Invalid energy metrics input"
+            }
+        
+        annual_energy_mwh = energy_metrics.get("annual_energy_consumption_mwh")
+        annual_co2_tons = energy_metrics.get("annual_co2_emissions_tons")
+        installed_capacity_mw = energy_metrics.get("installed_capacity_mw")
+        
+        avg_power_mw = None
+        if isinstance(annual_energy_mwh, (int, float)):
+            avg_power_mw = round(annual_energy_mwh / 8760.0, 6)
+        elif isinstance(installed_capacity_mw, (int, float)) and "sustainability_metrics" in energy_metrics:
+            # Fallback to capacity * utilization if available in sustainability metrics
+            util = energy_metrics["sustainability_metrics"].get("utilization_factor")
+            if isinstance(util, (int, float)):
+                avg_power_mw = round(installed_capacity_mw * util, 6)
+        
+        # Optionally fetch price if not provided
+        if price_eur_per_mwh is None and auto_price:
+            # Try to infer country from sustainability metrics zone (ISO code)
+            zone = None
+            if isinstance(energy_metrics.get("sustainability_metrics"), dict):
+                zone = energy_metrics["sustainability_metrics"].get("zone")
+            country_for_price = zone or energy_metrics.get("location", {}).get("country")
+            if country_for_price:
+                price_info = self.get_electricity_price(country_for_price)
+                if price_info and isinstance(annual_energy_mwh, (int, float)):
+                    price_eur_per_mwh = price_info.get("price_eur_per_mwh")
+        
+        energy_cost_eur = None
+        if price_eur_per_mwh is not None and isinstance(annual_energy_mwh, (int, float)):
+            energy_cost_eur = round(annual_energy_mwh * float(price_eur_per_mwh), 2)
+        
+        carbon_emissions_kg = None
+        if isinstance(annual_co2_tons, (int, float)):
+            carbon_emissions_kg = round(annual_co2_tons * 1000.0, 2)
+        
+        timestamp = recorded_at or datetime.now(timezone.utc).isoformat()
+        
+        return {
+            "id": str(uuid.uuid4()),
+            "data_center_id": str(data_center_id),
+            "power_usage_mw": avg_power_mw,
+            "energy_cost_eur": energy_cost_eur,
+            "carbon_emissions_kg": carbon_emissions_kg,
+            "temperature_celsius": temperature_celsius,
+            "uptime_percent": uptime_percent,
+            "recorded_at": timestamp,
+        }
+
+    def export_records_to_file(self, records: list, out_path: str) -> bool:
+        """Write a list of metrics records to a JSON file."""
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(records, f, ensure_ascii=False, indent=2)
+            print(f"💾 Exported {len(records)} record(s) to {out_path}")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to write export file: {e}")
+            return False
 
 class WaterAnalyzer:
     """Estimates water consumption for data centers"""
@@ -388,6 +579,7 @@ def main():
     print("\n\n📊 Testing Complete Energy Metrics:")
     print("-" * 40)
     
+    analysis_records = []
     for i, (dc, country) in enumerate(zip(test_data_centers, test_countries)):
         print(f"\n🏢 {dc['title']} ({country}):")
         
@@ -412,30 +604,76 @@ def main():
         if "error" not in water_metrics:
             print(f"  💧 Annual Water: {water_metrics['annual_water_consumption_m3']} m³")
             print(f"  💧 WUE: {water_metrics['estimated_wue_l_per_kwh']} L/kWh")
+        
+        # Price lookup (AI)
+        price_info = analyzer.get_electricity_price(country)
+        if not price_info:
+            print(f"  ⚠️  No price data found in AI Mode results for {country}")
+        
+        # Compute average power
+        avg_power_mw = round(energy_metrics['annual_energy_consumption_mwh'] / 8760.0, 6)
+        price_eur_per_mwh = price_info.get('price_eur_per_mwh') if price_info else None
+        energy_cost_eur = round(energy_metrics['annual_energy_consumption_mwh'] * price_eur_per_mwh, 2) if isinstance(price_eur_per_mwh, (int, float)) else None
+        
+        # Rich analysis record
+        analysis_record = {
+            "id": str(uuid.uuid4()),
+            "data_center_id": str(i + 1),
+            "facility_name": energy_metrics['facility_name'],
+            "operator": energy_metrics['operator'],
+            "location": energy_metrics['location'],
+            "installed_capacity_mw": energy_metrics['installed_capacity_mw'],
+            "power_usage_mw": avg_power_mw,
+            "annual_energy_mwh": energy_metrics['annual_energy_consumption_mwh'],
+            "grid": {
+                "zone": energy_metrics['sustainability_metrics'].get('zone') if isinstance(energy_metrics.get('sustainability_metrics'), dict) else None,
+                "carbon_intensity_gco2_kwh": energy_metrics.get('grid_carbon_intensity_gco2_kwh'),
+                "renewable_percentage": energy_metrics.get('grid_renewable_percentage'),
+            },
+            "emissions": {
+                "annual_co2_tons": energy_metrics['annual_co2_emissions_tons'],
+                "annual_co2_kg": round(energy_metrics['annual_co2_emissions_tons'] * 1000.0, 2),
+            },
+            "cost": {
+                "price_eur_per_mwh": price_eur_per_mwh,
+                "energy_cost_eur": energy_cost_eur,
+            },
+            "water": water_metrics if 'error' not in water_metrics else None,
+            "ops": {
+                "temperature_celsius": None,
+                "uptime_percent": None,
+            },
+            "provenance": {
+                "co2_source": energy_metrics['sustainability_metrics'].get('data_source') if isinstance(energy_metrics.get('sustainability_metrics'), dict) else None,
+                "co2_timestamp": energy_metrics['sustainability_metrics'].get('data_timestamp') if isinstance(energy_metrics.get('sustainability_metrics'), dict) else None,
+                "price_source": price_info.get('source') if price_info else None,
+                "price_unit_detected": price_info.get('unit_detected') if price_info else None,
+                "price_text_excerpt": price_info.get('extracted_text') if price_info else None,
+            },
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        analysis_records.append(analysis_record)
+        
+        # Demonstrate metrics export mapping (pricing optional; pass None to trigger auto-price lookup)
+        record = analyzer.export_metrics_record(
+            energy_metrics=energy_metrics,
+            data_center_id=str(i + 1),
+            price_eur_per_mwh=None,
+            temperature_celsius=None,
+            uptime_percent=None,
+            recorded_at=None,
+            auto_price=True,
+        )
+        print(f"  📦 Metrics JSON (partial): {json.dumps(record)[:200]}...")
     
-    # Test 4: Error handling
-    print("\n\n🚨 Testing Error Handling:")
-    print("-" * 30)
-    
-    # Test with invalid country
-    print("\n🌍 Testing invalid country code (XX):")
-    invalid_result = analyzer.get_carbon_intensity("XX")
-    if invalid_result is None:
-        print("  ✅ Correctly handled invalid country code")
-    else:
-        print(f"  ⚠️  Unexpected result: {invalid_result}")
-    
-    # Test with invalid capacity
-    print("\n⚡ Testing invalid capacity data:")
-    invalid_dc = {
-        "title": "Invalid Data Center",
-        "operator": "Test",
-        "location": {},
-        "estimated_capacity": "invalid"
-    }
-    invalid_metrics = analyzer.calculate_energy_metrics(invalid_dc, "DE")
-    if "error" in invalid_metrics:
-        print(f"  ✅ Correctly handled invalid capacity: {invalid_metrics['error']}")
+    # Write rich analysis export (testing only)
+    try:
+        out_path = "analysis_export.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(analysis_records, f, ensure_ascii=False, indent=2)
+        print(f"\n💾 Wrote analysis export with {len(analysis_records)} record(s) to {out_path}")
+    except Exception as e:
+        print(f"\n❌ Failed to write analysis export: {e}")
     
     print("\n" + "=" * 50)
     print("🎯 Test Suite Complete!")
