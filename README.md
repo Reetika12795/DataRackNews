@@ -1,6 +1,7 @@
 # DataRackNews 🏢
 
 **Real-time Data Center Intelligence & Monitoring Platform**
+https://datarack.info/
 
 A comprehensive web application for searching, analyzing, and monitoring data centers worldwide with detailed facility information, sustainability metrics, and market intelligence.
 
